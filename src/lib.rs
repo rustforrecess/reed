@@ -275,6 +275,27 @@ fn run_rules<F: Fn(&Option<String>) -> bool>(
         }
     }
 
+    // Temporal facts: a record whose SOURCE carries a PROV-O
+    // generatedAtTime becomes `dated(e, YEAR)`, so rules can constrain
+    // with sequent's comparison builtins:
+    //   current(P) :- dated(P, T), ge(T, 2020).
+    // Year granularity on purpose for v0.1 — Datalog terms are integers,
+    // and admission policies bind to editions ("standards current as of
+    // 2020"), not timestamps. Finer grain can become dated(e, days) later
+    // without a shape change.
+    for r in records {
+        let year = r
+            .source
+            .as_ref()
+            .and_then(|s| s.generated_at_time.as_deref())
+            .and_then(|t| t.get(..4))
+            .and_then(|y| y.parse::<i64>().ok());
+        if let Some(y) = year {
+            let a = intern(&r.evidence_id, &mut atom);
+            push_fact(&mut facts, &mut weights, format!("dated({a}, {y})."), 1.0);
+        }
+    }
+
     let src = format!("{}\n{}", facts.join("\n"), config.rules);
     let prog = Program::parse(&src)?;
     let admit = config.admit.expect("checked by caller");
@@ -392,6 +413,46 @@ mod tests {
             "vector-only support must not pass constriction"
         );
         assert_eq!(p2.strength, 0.0);
+    }
+
+    #[test]
+    fn temporal_constriction_excludes_stale_sources() {
+        // PROV-O dates on the passage records' sources become dated(P, Y)
+        // facts; a rule bounds the edition year. p1 and p2 have identical
+        // vector support — only their dates differ.
+        let mut records = heddle_pass();
+        let dated = |id: &str, t: &str| {
+            let mut e = Evidence::new(id, Producer::new("host", "test"), format!("{id} relevant"));
+            e.source = Some(evidence_core::Source {
+                id: "standards".into(),
+                locator: None,
+                generated_at_time: Some(t.into()),
+            });
+            e
+        };
+        records.push(dated("p1", "2015-06-01T00:00:00Z"));
+        records.push(dated("p2", "2024-09-01T00:00:00Z"));
+
+        let verdicts = judge(
+            &records,
+            &Config {
+                bases: &["found"],
+                rules: "current(P) :- dated(P, T), ge(T, 2020).\n\
+                        admissible(P) :- found(vector, P), current(P).",
+                admit: Some("admissible"),
+                semiring: SemiringChoice::MaxMin,
+                semantics: Semantics::DfQuad,
+            },
+        )
+        .unwrap();
+        let p1 = verdicts.iter().find(|v| v.on == "p1").unwrap();
+        let p2 = verdicts.iter().find(|v| v.on == "p2").unwrap();
+        assert!(!p1.admitted, "2015 source fails the 2020 bound: {p1:?}");
+        assert!(p2.admitted, "{p2:?}");
+        assert!(
+            p2.proof.as_ref().unwrap().contains("dated("),
+            "the proof shows which date satisfied the bound: {p2:?}"
+        );
     }
 
     #[test]
