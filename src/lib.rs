@@ -27,6 +27,8 @@
 //! `semiring` and `semantics` swap the mathematics — all over the SAME
 //! stored records, no re-retrieval per condition.
 
+pub mod report;
+
 use std::collections::HashMap;
 
 use evidence_core::{Evidence, Polarity};
@@ -70,7 +72,8 @@ pub struct Config<'a> {
 }
 
 /// One judged claim.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Verdict {
     /// The `evidence_id` of the record whose claim was judged.
     pub on: String,
@@ -92,8 +95,15 @@ pub struct Verdict {
     pub proof: Option<String>,
 }
 
-/// Judge `records` under `config`. Claims are the targets of the included
-/// bearings; records that nothing bears on are not judged.
+/// Judge `records` under `config`.
+///
+/// A record ARGUES or IS ARGUED ABOUT: anything a bearing targets is a
+/// claim, and any record carrying no bearings of its own is a claim too.
+/// That one rule covers both producers without special cases — heddle's
+/// testimonies (bearing-carriers) judge its passages, while a11y-agent's
+/// findings (bearing-less, self-standing) are judged directly, and an
+/// instructor-exception record that inhibits a finding automatically stops
+/// being a claim and becomes an arguer.
 pub fn judge(records: &[Evidence], config: &Config<'_>) -> Result<Vec<Verdict>, String> {
     let included = |basis: &Option<String>| {
         config.bases.is_empty() || basis.as_deref().is_some_and(|b| config.bases.contains(&b))
@@ -116,6 +126,13 @@ pub fn judge(records: &[Evidence], config: &Config<'_>) -> Result<Vec<Verdict>, 
                 Polarity::Promotes => promotes.entry(&b.on).or_default().push(b.weight),
                 Polarity::Inhibits => inhibits.entry(&b.on).or_default().push(b.weight),
             }
+        }
+    }
+    // Bearing-less records are claims in their own right (see above).
+    let mut seen: std::collections::HashSet<&str> = targets.iter().copied().collect();
+    for r in records {
+        if r.bearings.is_empty() && seen.insert(r.evidence_id.as_str()) {
+            targets.push(&r.evidence_id);
         }
     }
 
@@ -211,7 +228,7 @@ fn run_rules<F: Fn(&Option<String>) -> bool>(
     // Intern ids as atoms: evidence ids ("pass-1#p1") are not Datalog
     // atoms, so each becomes e0, e1, ... and the table maps back.
     let mut atom: HashMap<String, String> = HashMap::new();
-    let mut intern = |id: &str, atom: &mut HashMap<String, String>| -> String {
+    let intern = |id: &str, atom: &mut HashMap<String, String>| -> String {
         let n = atom.len();
         atom.entry(id.to_string())
             .or_insert_with(|| format!("e{n}"))
@@ -220,7 +237,7 @@ fn run_rules<F: Fn(&Option<String>) -> bool>(
 
     let mut facts: Vec<String> = Vec::new();
     let mut weights: HashMap<usize, f64> = HashMap::new();
-    let mut push_fact =
+    let push_fact =
         |facts: &mut Vec<String>, weights: &mut HashMap<usize, f64>, text: String, w: f64| {
             weights.insert(facts.len(), w);
             facts.push(text);
@@ -272,6 +289,18 @@ fn run_rules<F: Fn(&Option<String>) -> bool>(
                     )
                 }
             }
+        }
+    }
+
+    // Check facts: a record's OWN verification status, so admission rules
+    // can constrain on it — `reportable(F) :- verified(F).` is the whole
+    // verified-only tier of an a11y report, and `refuted` lets rules
+    // exclude findings an adversarial pass dismissed.
+    for r in records {
+        if let Some(c) = &r.check {
+            let a = intern(&r.evidence_id, &mut atom);
+            let fact = if c.upheld { "verified" } else { "refuted" };
+            push_fact(&mut facts, &mut weights, format!("{fact}({a})."), 1.0);
         }
     }
 

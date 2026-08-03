@@ -58,6 +58,29 @@ The input is any set of evidence-core records with bearings. heddle's
 `found` / `informed-silence` bearings and path kinds flatten directly into
 the rule vocabulary.
 
+## The report tier
+
+`reed-report` turns any evidence-record files into a tiered Markdown report —
+the human-signable end of the pipeline:
+
+```sh
+echo "reportable(F) :- verified(F)." > verified.dl
+reed-report reports/run-*/evidence.json --rules verified.dl --title "Course audit" > audit.md
+```
+
+Tiers lead with the distinction an auditor needs: **reportable-verified**
+(admitted + upheld check — what a compliance statement cites),
+**reportable-unverified**, **contested** (an exception or counter-finding
+argues against it; contestedness says how much), and **excluded** (refuted or
+not admitted — kept *with reasons*, because a silently dropped finding is a
+liability). Admission proofs are included verbatim.
+
+Claim selection is one rule: **a record argues, or is argued about.** Bearing
+targets are claims; bearing-less records are claims themselves; a record that
+bears on others (a heddle testimony, an instructor exception) is an arguer.
+Records' own checks surface to the rules as `verified(F)` / `refuted(F)`
+facts, so the verified-only tier is one line of Datalog.
+
 ## Status
 
 v0.1 — the two-layer core, with tests covering constriction (weakest-link

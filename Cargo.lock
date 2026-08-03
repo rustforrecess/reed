@@ -64,6 +64,7 @@ version = "0.1.0"
 dependencies = [
  "evidence-core",
  "sequent",
+ "serde",
  "serde_json",
 ]
 
