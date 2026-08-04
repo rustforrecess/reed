@@ -107,6 +107,7 @@ fn main() -> ExitCode {
         &records,
         &Config {
             bases: &[],
+            scale: &[],
             rules: &rules,
             admit: admit.as_deref(),
             semiring,

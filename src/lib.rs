@@ -59,6 +59,12 @@ pub enum Semantics {
 pub struct Config<'a> {
     /// Signal classes (bearing `basis` values) that count. Empty = all.
     pub bases: &'a [&'a str],
+    /// Judge-time weight multipliers per basis — calibration WITHOUT
+    /// re-retrieval, over the same stored records. `bases` inclusion is the
+    /// degenerate 0/1 case of this; a `("informed-silence", 1.5)` entry
+    /// asks "what if silence argued half again as hard?" Scaled weights
+    /// clamp into [0, 1]. Unlisted bases keep factor 1.
+    pub scale: &'a [(&'a str, f64)],
     /// Caller Datalog policy, e.g.
     /// `admissible(P) :- found(symbolic, P), found(vector, P).`
     /// Empty = no logical layer; everything is admitted.
@@ -114,6 +120,20 @@ pub fn judge(records: &[Evidence], config: &Config<'_>) -> Result<Vec<Verdict>, 
     let mut promotes: HashMap<&str, Vec<f64>> = HashMap::new();
     let mut inhibits: HashMap<&str, Vec<f64>> = HashMap::new();
     let mut targets: Vec<&str> = Vec::new();
+    let scaled = |b: &evidence_core::Bearing| {
+        let factor = b
+            .basis
+            .as_deref()
+            .and_then(|basis| {
+                config
+                    .scale
+                    .iter()
+                    .find(|(name, _)| *name == basis)
+                    .map(|(_, f)| *f)
+            })
+            .unwrap_or(1.0);
+        (b.weight * factor).clamp(0.0, 1.0)
+    };
     for r in records {
         for b in &r.bearings {
             if !included(&b.basis) {
@@ -123,8 +143,8 @@ pub fn judge(records: &[Evidence], config: &Config<'_>) -> Result<Vec<Verdict>, 
                 targets.push(&b.on);
             }
             match b.polarity {
-                Polarity::Promotes => promotes.entry(&b.on).or_default().push(b.weight),
-                Polarity::Inhibits => inhibits.entry(&b.on).or_default().push(b.weight),
+                Polarity::Promotes => promotes.entry(&b.on).or_default().push(scaled(b)),
+                Polarity::Inhibits => inhibits.entry(&b.on).or_default().push(scaled(b)),
             }
         }
     }
@@ -422,6 +442,7 @@ mod tests {
             &heddle_pass(),
             &Config {
                 bases: &["found"],
+                scale: &[],
                 rules: CONSTRICTION,
                 admit: Some("admissible"),
                 semiring: SemiringChoice::MaxMin,
@@ -466,6 +487,7 @@ mod tests {
             &records,
             &Config {
                 bases: &["found"],
+                scale: &[],
                 rules: "current(P) :- dated(P, T), ge(T, 2020).\n\
                         admissible(P) :- found(vector, P), current(P).",
                 admit: Some("admissible"),
@@ -492,6 +514,7 @@ mod tests {
             &heddle_pass(),
             &Config {
                 bases: &[],
+                scale: &[],
                 rules: "",
                 admit: None,
                 semiring: SemiringChoice::Boolean,
@@ -514,6 +537,7 @@ mod tests {
                 &heddle_pass(),
                 &Config {
                     bases,
+                    scale: &[],
                     rules: "",
                     admit: None,
                     semiring: SemiringChoice::Boolean,
@@ -539,12 +563,49 @@ mod tests {
     }
 
     #[test]
+    fn scaling_a_basis_is_calibration_without_re_retrieval() {
+        // The same stored records, silence argued at 1× vs 3×: p2's
+        // strength must drop monotonically, and scale 0 must equal
+        // excluding the basis outright (inclusion is the 0/1 special case).
+        let run = |scale: &'static [(&'static str, f64)], bases: &'static [&'static str]| {
+            judge(
+                &heddle_pass(),
+                &Config {
+                    bases,
+                    scale,
+                    rules: "",
+                    admit: None,
+                    semiring: SemiringChoice::Boolean,
+                    semantics: Semantics::DfQuad,
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .find(|v| v.on == "p2")
+            .unwrap()
+        };
+        let x1 = run(&[], &[]);
+        let x3 = run(&[("informed-silence", 3.0)], &[]);
+        assert!(
+            x3.strength < x1.strength,
+            "amplified silence must argue harder: {x3:?} vs {x1:?}"
+        );
+        let zero = run(&[("informed-silence", 0.0)], &[]);
+        let excluded = run(&[], &["found"]);
+        assert!(
+            (zero.strength - excluded.strength).abs() < 1e-12,
+            "scale 0 must equal exclusion: {zero:?} vs {excluded:?}"
+        );
+    }
+
+    #[test]
     fn both_semantics_agree_on_direction_and_differ_on_shape() {
         let run = |semantics| {
             judge(
                 &heddle_pass(),
                 &Config {
                     bases: &[],
+                    scale: &[],
                     rules: "",
                     admit: None,
                     semiring: SemiringChoice::Boolean,
