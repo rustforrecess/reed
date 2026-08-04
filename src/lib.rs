@@ -16,10 +16,13 @@
 //!    chooses hard admission (Boolean), weakest-link (MaxMin), or an
 //!    independent-evidence reading (Probability).
 //! 2. **Semantics decides HOW MUCH** — the bipolar bearing graph (promote /
-//!    inhibit, weighted) is scored over the admitted claims by a gradual
-//!    semantics (DF-QuAD or log-odds), yielding a strength AND a
-//!    contestedness: how one-sided the evidence was, which a bare strength
-//!    hides.
+//!    inhibit, weighted) is scored GRAPH-RECURSIVELY by a gradual semantics
+//!    (DF-QuAD or log-odds): an arguer's own standing damps its arguments,
+//!    so a refuted or argued-down exception cannot suppress a finding at
+//!    full weight. Untargeted arguers sit at the neutral base, damp
+//!    nothing, and flat graphs score exactly as one-hop evaluation.
+//!    Verdicts carry a strength AND a contestedness: how one-sided the
+//!    evidence was, which a bare strength hides.
 //!
 //! Every knob is an experimental variable, because the whole point is
 //! ablation: `bases` includes or excludes signal classes ("found",
@@ -115,11 +118,20 @@ pub fn judge(records: &[Evidence], config: &Config<'_>) -> Result<Vec<Verdict>, 
         config.bases.is_empty() || basis.as_deref().is_some_and(|b| config.bases.contains(&b))
     };
 
-    // The bipolar graph: per target, the included promoting / inhibiting
-    // weights, in record order (deterministic folds).
-    let mut promotes: HashMap<&str, Vec<f64>> = HashMap::new();
-    let mut inhibits: HashMap<&str, Vec<f64>> = HashMap::new();
+    // The bipolar graph as EDGES (arguer -> target), in record order for
+    // deterministic folds. Bearing weights cross a trust boundary here —
+    // records arrive from JSON files, not only from our own constructors —
+    // so they are sanitized exactly as heddle sanitizes host scores:
+    // non-finite means no influence, and everything clamps into [0, 1].
+    struct BEdge<'r> {
+        from: &'r str,
+        to: &'r str,
+        polarity: Polarity,
+        weight: f64,
+    }
+    let mut edges: Vec<BEdge<'_>> = Vec::new();
     let mut targets: Vec<&str> = Vec::new();
+    let mut targeted: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let scaled = |b: &evidence_core::Bearing| {
         let factor = b
             .basis
@@ -132,26 +144,32 @@ pub fn judge(records: &[Evidence], config: &Config<'_>) -> Result<Vec<Verdict>, 
                     .map(|(_, f)| *f)
             })
             .unwrap_or(1.0);
-        (b.weight * factor).clamp(0.0, 1.0)
+        let w = b.weight * factor;
+        if w.is_finite() {
+            w.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
     };
     for r in records {
         for b in &r.bearings {
             if !included(&b.basis) {
                 continue;
             }
-            if !promotes.contains_key(b.on.as_str()) && !inhibits.contains_key(b.on.as_str()) {
+            if targeted.insert(b.on.as_str()) {
                 targets.push(&b.on);
             }
-            match b.polarity {
-                Polarity::Promotes => promotes.entry(&b.on).or_default().push(scaled(b)),
-                Polarity::Inhibits => inhibits.entry(&b.on).or_default().push(scaled(b)),
-            }
+            edges.push(BEdge {
+                from: &r.evidence_id,
+                to: &b.on,
+                polarity: b.polarity,
+                weight: scaled(b),
+            });
         }
     }
     // Bearing-less records are claims in their own right (see above).
-    let mut seen: std::collections::HashSet<&str> = targets.iter().copied().collect();
     for r in records {
-        if r.bearings.is_empty() && seen.insert(r.evidence_id.as_str()) {
+        if r.bearings.is_empty() && targeted.insert(r.evidence_id.as_str()) {
             targets.push(&r.evidence_id);
         }
     }
@@ -168,6 +186,55 @@ pub fn judge(records: &[Evidence], config: &Config<'_>) -> Result<Vec<Verdict>, 
         Some(run_rules(records, config, &targets, &included)?)
     };
 
+    // GRAPH-RECURSIVE gradual scoring. An arguer's own standing modulates
+    // how hard its arguments count: a refuted or argued-down exception
+    // must not suppress a finding at full weight. Each edge's effective
+    // weight is `w × damp(arguer)` where damp = (strength/0.5).clamp(0,1)
+    // — an untargeted arguer sits at the neutral 0.5, damp = 1, so FLAT
+    // graphs score bit-identically to one-hop evaluation (every earlier
+    // number, test, and treadle table is unchanged by construction).
+    // Jacobi iteration (each round reads only the previous round) keeps it
+    // deterministic and order-independent; acyclic graphs reach fixpoint
+    // in depth rounds, cycles are cut off at MAX_ROUNDS and settle
+    // deterministically rather than looping.
+    const MAX_ROUNDS: usize = 100;
+    let mut strengths: HashMap<&str, f64> = HashMap::new();
+    for e in &edges {
+        strengths.entry(e.from).or_insert(0.5);
+        strengths.entry(e.to).or_insert(0.5);
+    }
+    for t in &targets {
+        strengths.entry(t).or_insert(0.5);
+    }
+    let mut final_pi: HashMap<&str, (Vec<f64>, Vec<f64>)> = HashMap::new();
+    for _ in 0..MAX_ROUNDS {
+        let mut next: HashMap<&str, (Vec<f64>, Vec<f64>)> = HashMap::new();
+        for e in &edges {
+            let damp = (strengths[e.from] / 0.5).clamp(0.0, 1.0);
+            let slot = next.entry(e.to).or_default();
+            match e.polarity {
+                Polarity::Promotes => slot.0.push(e.weight * damp),
+                Polarity::Inhibits => slot.1.push(e.weight * damp),
+            }
+        }
+        let mut changed = false;
+        for (node, s) in strengths.iter_mut() {
+            let (p, i) = next
+                .get(node)
+                .map(|(p, i)| (p.as_slice(), i.as_slice()))
+                .unwrap_or((&[], &[]));
+            let v = score(p, i, config.semantics);
+            if (v - *s).abs() > 1e-12 {
+                *s = v;
+                changed = true;
+            }
+        }
+        final_pi = next;
+        if !changed {
+            break;
+        }
+    }
+
     let mut out = Vec::new();
     for target in targets {
         let (admitted, tag, proof) = match &admission {
@@ -178,10 +245,12 @@ pub fn judge(records: &[Evidence], config: &Config<'_>) -> Result<Vec<Verdict>, 
             },
         };
 
-        let p = promotes.get(target).cloned().unwrap_or_default();
-        let i = inhibits.get(target).cloned().unwrap_or_default();
+        let (p, i) = final_pi
+            .get(target)
+            .map(|(p, i)| (p.as_slice(), i.as_slice()))
+            .unwrap_or((&[], &[]));
         let strength = if admitted {
-            score(&p, &i, config.semantics)
+            *strengths.get(target).unwrap_or(&0.5)
         } else {
             0.0
         };
@@ -191,7 +260,7 @@ pub fn judge(records: &[Evidence], config: &Config<'_>) -> Result<Vec<Verdict>, 
             admitted,
             admission: tag,
             strength,
-            contestedness: contestedness(&p, &i),
+            contestedness: contestedness(p, i),
             proof,
         });
     }
@@ -595,6 +664,121 @@ mod tests {
         assert!(
             (zero.strength - excluded.strength).abs() < 1e-12,
             "scale 0 must equal exclusion: {zero:?} vs {excluded:?}"
+        );
+    }
+
+    #[test]
+    fn a_counter_argued_exception_argues_less() {
+        // The graph-recursive payoff: an instructor exception inhibits a
+        // finding; a counter-record then inhibits the EXCEPTION. The
+        // exception's damaged standing must damp its argument — the
+        // finding stands taller than when the exception went unopposed.
+        let finding = |id: &str| Evidence::new(id, Producer::new("t", "t"), "finding");
+        let mut exception = finding("exception");
+        exception.bearings = vec![Bearing::inhibits("f", 0.6).with_basis("exception")];
+        let cfg = Config {
+            bases: &[],
+            scale: &[],
+            rules: "",
+            admit: None,
+            semiring: SemiringChoice::Boolean,
+            semantics: Semantics::DfQuad,
+        };
+
+        let unopposed = judge(&[finding("f"), exception.clone()], &cfg).unwrap();
+        let f_unopposed = unopposed.iter().find(|v| v.on == "f").unwrap().strength;
+
+        let mut counter = finding("counter");
+        counter.bearings = vec![Bearing::inhibits("exception", 0.8).with_basis("stance")];
+        let opposed = judge(&[finding("f"), exception, counter], &cfg).unwrap();
+        let f_opposed = opposed.iter().find(|v| v.on == "f").unwrap().strength;
+
+        assert!((f_unopposed - 0.2).abs() < 1e-9, "one-hop: 0.5 − 0.5·0.6");
+        assert!(
+            f_opposed > f_unopposed,
+            "damped exception must argue less: {f_opposed} vs {f_unopposed}"
+        );
+        // Exactly: exception strength 0.5−0.5·0.8 = 0.1, damp 0.2,
+        // effective inhibit 0.12, f = 0.5 − 0.5·0.12 = 0.44.
+        assert!((f_opposed - 0.44).abs() < 1e-9, "{f_opposed}");
+    }
+
+    #[test]
+    fn an_untargeted_arguer_damps_nothing() {
+        // Backward compatibility, stated as a property: arguers nobody
+        // argues about sit at neutral 0.5 → damp 1 → flat graphs score
+        // exactly as one-hop evaluation always did.
+        let verdicts = judge(
+            &heddle_pass(),
+            &Config {
+                bases: &["found"],
+                scale: &[],
+                rules: "",
+                admit: None,
+                semiring: SemiringChoice::Boolean,
+                semantics: Semantics::DfQuad,
+            },
+        )
+        .unwrap();
+        let p1 = verdicts.iter().find(|v| v.on == "p1").unwrap();
+        // p1: found 0.7 and 0.9 → vs = 1−0.3·0.1 = 0.97 → 0.985, undamped.
+        assert!((p1.strength - 0.985).abs() < 1e-9, "{p1:?}");
+    }
+
+    #[test]
+    fn cycles_terminate_deterministically() {
+        let node = |id: &str, on: &str| {
+            let mut e = Evidence::new(id, Producer::new("t", "t"), "claim");
+            e.bearings = vec![Bearing::inhibits(on, 0.5).with_basis("stance")];
+            e
+        };
+        let cfg = Config {
+            bases: &[],
+            scale: &[],
+            rules: "",
+            admit: None,
+            semiring: SemiringChoice::Boolean,
+            semantics: Semantics::DfQuad,
+        };
+        let a = judge(&[node("a", "b"), node("b", "a")], &cfg).unwrap();
+        let b = judge(&[node("a", "b"), node("b", "a")], &cfg).unwrap();
+        for v in &a {
+            assert!((0.0..=1.0).contains(&v.strength), "{v:?}");
+        }
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.strength.to_bits(), y.strength.to_bits(), "deterministic");
+        }
+    }
+
+    #[test]
+    fn non_finite_weights_from_foreign_records_mean_no_influence() {
+        // Records arrive from JSON, not only our constructors: a NaN or
+        // negative weight must sanitize to zero influence, same rule as
+        // heddle's host-score guard.
+        let mut hostile = Evidence::new("h", Producer::new("t", "t"), "claim");
+        hostile.bearings = vec![Bearing {
+            on: "f".into(),
+            polarity: Polarity::Inhibits,
+            weight: f64::NAN,
+            basis: Some("stance".into()),
+        }];
+        let f = Evidence::new("f", Producer::new("t", "t"), "finding");
+        let verdicts = judge(
+            &[f, hostile],
+            &Config {
+                bases: &[],
+                scale: &[],
+                rules: "",
+                admit: None,
+                semiring: SemiringChoice::Boolean,
+                semantics: Semantics::DfQuad,
+            },
+        )
+        .unwrap();
+        let f = verdicts.iter().find(|v| v.on == "f").unwrap();
+        assert!(
+            (f.strength - 0.5).abs() < 1e-12,
+            "NaN argues nothing: {f:?}"
         );
     }
 
