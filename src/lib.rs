@@ -25,16 +25,20 @@
 //!    evidence was, which a bare strength hides.
 //!
 //! Every knob is an experimental variable, because the whole point is
-//! ablation: `bases` includes or excludes signal classes ("found",
-//! "informed-silence", "stance"), `rules`+`admit` toggle constriction,
+//! ablation: `schemes` sets policy over argument KINDS from the closed
+//! evidence-core registry ("positive-evidence", "negative-evidence"), with
+//! `bases`/`scale` as the per-signal override level ("found",
+//! "informed-silence", "stance"); `rules`+`admit` toggle constriction;
 //! `semiring` and `semantics` swap the mathematics — all over the SAME
-//! stored records, no re-retrieval per condition.
+//! stored records, no re-retrieval per condition. Config names are
+//! validated against the registry, so a typo'd condition is a loud error
+//! rather than a number that silently measured nothing.
 
 pub mod report;
 
 use std::collections::HashMap;
 
-use evidence_core::{Evidence, Polarity};
+use evidence_core::{registry, Evidence, Polarity};
 use sequent::prolog::Program;
 use sequent::weighted::{Boolean, MaxMin, Probability, Semiring, saturate_weighted};
 
@@ -61,13 +65,27 @@ pub enum Semantics {
 
 pub struct Config<'a> {
     /// Signal classes (bearing `basis` values) that count. Empty = all.
+    /// This is the basis-level allowlist; prefer `schemes` for policy and
+    /// reserve this for isolating specific signals. Mutually exclusive
+    /// with `schemes`.
     pub bases: &'a [&'a str],
     /// Judge-time weight multipliers per basis — calibration WITHOUT
     /// re-retrieval, over the same stored records. `bases` inclusion is the
     /// degenerate 0/1 case of this; a `("informed-silence", 1.5)` entry
     /// asks "what if silence argued half again as hard?" Scaled weights
-    /// clamp into [0, 1]. Unlisted bases keep factor 1.
+    /// clamp into [0, 1]. Unlisted bases keep factor 1. In `schemes` mode
+    /// this is the per-basis override, multiplied onto the scheme's factor.
     pub scale: &'a [(&'a str, f64)],
+    /// Scheme-level policy: factors keyed on the CLOSED argument-kind
+    /// vocabulary (evidence-core `registry/schemes.jsonld`) instead of
+    /// producer basis strings. Non-empty = an allowlist: each bearing
+    /// resolves basis → scheme, takes the scheme's factor, and multiplies
+    /// any per-basis `scale` override on top; a bearing whose scheme is
+    /// unlisted — or whose basis the registry does not know — is excluded.
+    /// Policy written here governs signals from producers that do not
+    /// exist yet, the moment they declare a registered basis. Mutually
+    /// exclusive with `bases`.
+    pub schemes: &'a [(&'a str, f64)],
     /// Caller Datalog policy, e.g.
     /// `admissible(P) :- found(symbolic, P), found(vector, P).`
     /// Empty = no logical layer; everything is admitted.
@@ -78,6 +96,22 @@ pub struct Config<'a> {
     pub admit: Option<&'a str>,
     pub semiring: SemiringChoice,
     pub semantics: Semantics,
+}
+
+impl Default for Config<'_> {
+    /// The no-policy baseline: every signal counts at its recorded weight,
+    /// nothing is constricted, Boolean admission, DF-QuAD scoring.
+    fn default() -> Self {
+        Config {
+            bases: &[],
+            scale: &[],
+            schemes: &[],
+            rules: "",
+            admit: None,
+            semiring: SemiringChoice::Boolean,
+            semantics: Semantics::DfQuad,
+        }
+    }
 }
 
 /// One judged claim.
@@ -114,9 +148,74 @@ pub struct Verdict {
 /// instructor-exception record that inhibits a finding automatically stops
 /// being a claim and becomes an arguer.
 pub fn judge(records: &[Evidence], config: &Config<'_>) -> Result<Vec<Verdict>, String> {
-    let included = |basis: &Option<String>| {
-        config.bases.is_empty() || basis.as_deref().is_some_and(|b| config.bases.contains(&b))
+    // Config names are checked BEFORE anything is scored. In an ablation
+    // harness a typo'd name would otherwise become a condition that
+    // silently measures nothing — worse than an error, because its number
+    // still lands in a results table.
+    if !config.bases.is_empty() && !config.schemes.is_empty() {
+        return Err(
+            "config sets both `bases` and `schemes`; pick one level — `schemes` \
+             with per-basis `scale` overrides covers both jobs"
+                .into(),
+        );
+    }
+    for (name, _) in config.schemes {
+        if !registry::is_scheme(name) {
+            return Err(format!(
+                "config schemes name `{name}`, which is not a registered scheme \
+                 (see evidence-core registry/schemes.jsonld)"
+            ));
+        }
+    }
+    let record_bases: std::collections::HashSet<&str> = records
+        .iter()
+        .flat_map(|r| &r.bearings)
+        .filter_map(|b| b.basis.as_deref())
+        .collect();
+    for name in config
+        .bases
+        .iter()
+        .chain(config.scale.iter().map(|(n, _)| n))
+    {
+        if !registry::is_basis(name) && !record_bases.contains(name) {
+            return Err(format!(
+                "config names basis `{name}`, which neither the registry nor \
+                 these records know"
+            ));
+        }
+    }
+
+    // Per-bearing inclusion factor: basis override → scheme default →
+    // excluded. `None` means the edge does not participate at all — which
+    // is different from a factor of 0, whose edge still exists (and still
+    // registers its target as a claim) at zero influence.
+    let factor = |basis: &Option<String>| -> Option<f64> {
+        let base_scale = |b: &str| config.scale.iter().find(|(n, _)| *n == b).map(|(_, f)| *f);
+        match basis.as_deref() {
+            // An untagged edge cannot be resolved by name, so it only rides
+            // when no name-keyed policy is in force.
+            None => (config.bases.is_empty() && config.schemes.is_empty()).then_some(1.0),
+            Some(b) => {
+                if !config.bases.is_empty() {
+                    config
+                        .bases
+                        .contains(&b)
+                        .then(|| base_scale(b).unwrap_or(1.0))
+                } else if !config.schemes.is_empty() {
+                    let scheme = registry::scheme_of(b)?;
+                    let scheme_factor = config
+                        .schemes
+                        .iter()
+                        .find(|(n, _)| *n == scheme)
+                        .map(|(_, f)| *f)?;
+                    Some(scheme_factor * base_scale(b).unwrap_or(1.0))
+                } else {
+                    Some(base_scale(b).unwrap_or(1.0))
+                }
+            }
+        }
     };
+    let included = |basis: &Option<String>| factor(basis).is_some();
 
     // The bipolar graph as EDGES (arguer -> target), in record order for
     // deterministic folds. Bearing weights cross a trust boundary here —
@@ -132,38 +231,18 @@ pub fn judge(records: &[Evidence], config: &Config<'_>) -> Result<Vec<Verdict>, 
     let mut edges: Vec<BEdge<'_>> = Vec::new();
     let mut targets: Vec<&str> = Vec::new();
     let mut targeted: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let scaled = |b: &evidence_core::Bearing| {
-        let factor = b
-            .basis
-            .as_deref()
-            .and_then(|basis| {
-                config
-                    .scale
-                    .iter()
-                    .find(|(name, _)| *name == basis)
-                    .map(|(_, f)| *f)
-            })
-            .unwrap_or(1.0);
-        let w = b.weight * factor;
-        if w.is_finite() {
-            w.clamp(0.0, 1.0)
-        } else {
-            0.0
-        }
-    };
     for r in records {
         for b in &r.bearings {
-            if !included(&b.basis) {
-                continue;
-            }
+            let Some(f) = factor(&b.basis) else { continue };
             if targeted.insert(b.on.as_str()) {
                 targets.push(&b.on);
             }
+            let w = b.weight * f;
             edges.push(BEdge {
                 from: &r.evidence_id,
                 to: &b.on,
                 polarity: b.polarity,
-                weight: scaled(b),
+                weight: if w.is_finite() { w.clamp(0.0, 1.0) } else { 0.0 },
             });
         }
     }
@@ -512,6 +591,7 @@ mod tests {
             &Config {
                 bases: &["found"],
                 scale: &[],
+                schemes: &[],
                 rules: CONSTRICTION,
                 admit: Some("admissible"),
                 semiring: SemiringChoice::MaxMin,
@@ -557,6 +637,7 @@ mod tests {
             &Config {
                 bases: &["found"],
                 scale: &[],
+                schemes: &[],
                 rules: "current(P) :- dated(P, T), ge(T, 2020).\n\
                         admissible(P) :- found(vector, P), current(P).",
                 admit: Some("admissible"),
@@ -584,6 +665,7 @@ mod tests {
             &Config {
                 bases: &[],
                 scale: &[],
+                schemes: &[],
                 rules: "",
                 admit: None,
                 semiring: SemiringChoice::Boolean,
@@ -607,6 +689,7 @@ mod tests {
                 &Config {
                     bases,
                     scale: &[],
+                    schemes: &[],
                     rules: "",
                     admit: None,
                     semiring: SemiringChoice::Boolean,
@@ -642,6 +725,7 @@ mod tests {
                 &Config {
                     bases,
                     scale,
+                    schemes: &[],
                     rules: "",
                     admit: None,
                     semiring: SemiringChoice::Boolean,
@@ -676,14 +760,7 @@ mod tests {
         let finding = |id: &str| Evidence::new(id, Producer::new("t", "t"), "finding");
         let mut exception = finding("exception");
         exception.bearings = vec![Bearing::inhibits("f", 0.6).with_basis("exception")];
-        let cfg = Config {
-            bases: &[],
-            scale: &[],
-            rules: "",
-            admit: None,
-            semiring: SemiringChoice::Boolean,
-            semantics: Semantics::DfQuad,
-        };
+        let cfg = Config::default();
 
         let unopposed = judge(&[finding("f"), exception.clone()], &cfg).unwrap();
         let f_unopposed = unopposed.iter().find(|v| v.on == "f").unwrap().strength;
@@ -713,6 +790,7 @@ mod tests {
             &Config {
                 bases: &["found"],
                 scale: &[],
+                schemes: &[],
                 rules: "",
                 admit: None,
                 semiring: SemiringChoice::Boolean,
@@ -732,14 +810,7 @@ mod tests {
             e.bearings = vec![Bearing::inhibits(on, 0.5).with_basis("stance")];
             e
         };
-        let cfg = Config {
-            bases: &[],
-            scale: &[],
-            rules: "",
-            admit: None,
-            semiring: SemiringChoice::Boolean,
-            semantics: Semantics::DfQuad,
-        };
+        let cfg = Config::default();
         let a = judge(&[node("a", "b"), node("b", "a")], &cfg).unwrap();
         let b = judge(&[node("a", "b"), node("b", "a")], &cfg).unwrap();
         for v in &a {
@@ -748,6 +819,141 @@ mod tests {
         for (x, y) in a.iter().zip(b.iter()) {
             assert_eq!(x.strength.to_bits(), y.strength.to_bits(), "deterministic");
         }
+    }
+
+    #[test]
+    fn scheme_mode_matches_the_equivalent_basis_mode() {
+        // Policy written against argument KINDS resolves through the
+        // registry to exactly what naming every basis would produce —
+        // which is what lets a config govern producers that don't exist
+        // yet.
+        let records = heddle_pass();
+        let by_basis = judge(
+            &records,
+            &Config {
+                bases: &["found", "informed-silence"],
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        let by_scheme = judge(
+            &records,
+            &Config {
+                schemes: &[("positive-evidence", 1.0), ("negative-evidence", 1.0)],
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(by_basis.len(), by_scheme.len());
+        for (a, b) in by_basis.iter().zip(&by_scheme) {
+            assert_eq!(a.on, b.on);
+            assert_eq!(a.strength.to_bits(), b.strength.to_bits(), "{}", a.on);
+            assert_eq!(a.contestedness.to_bits(), b.contestedness.to_bits());
+        }
+    }
+
+    #[test]
+    fn basis_scale_overrides_inside_scheme_mode() {
+        // Scheme default, basis override: negative evidence is admitted as
+        // a kind, but heddle's specific silence signal is dialed to zero —
+        // the ablation granularity survives the move to scheme-keyed
+        // policy.
+        let records = heddle_pass();
+        let overridden = judge(
+            &records,
+            &Config {
+                schemes: &[("positive-evidence", 1.0), ("negative-evidence", 1.0)],
+                scale: &[("informed-silence", 0.0)],
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        let excluded = judge(
+            &records,
+            &Config {
+                bases: &["found"],
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        for v in &excluded {
+            let o = overridden.iter().find(|o| o.on == v.on).unwrap();
+            assert_eq!(v.strength.to_bits(), o.strength.to_bits(), "{}", v.on);
+        }
+    }
+
+    #[test]
+    fn a_config_typo_is_a_loud_error_not_a_silent_no_op() {
+        // The whole point of registry validation: a misspelled condition
+        // must fail, never land a meaningless number in a results table.
+        let e = judge(
+            &heddle_pass(),
+            &Config {
+                schemes: &[("negative-evidnce", 1.0)],
+                ..Config::default()
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("negative-evidnce"), "{e}");
+
+        let e = judge(
+            &heddle_pass(),
+            &Config {
+                bases: &["infromed-silence"],
+                ..Config::default()
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("infromed-silence"), "{e}");
+    }
+
+    #[test]
+    fn bases_and_schemes_together_are_rejected() {
+        let e = judge(
+            &heddle_pass(),
+            &Config {
+                bases: &["found"],
+                schemes: &[("positive-evidence", 1.0)],
+                ..Config::default()
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("both"), "{e}");
+    }
+
+    #[test]
+    fn foreign_bases_live_in_records_not_the_registry() {
+        // A basis the registry doesn't know is legal DATA — config may
+        // name it (it exists in the records), but scheme mode excludes it,
+        // because an unregistered signal has no kind to resolve through.
+        let mut foreign = Evidence::new("x", Producer::new("other", "0"), "claim");
+        foreign.bearings = vec![Bearing::promotes("p", 0.8).with_basis("my-signal")];
+
+        let by_name = judge(
+            &[foreign.clone()],
+            &Config {
+                bases: &["my-signal"],
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            by_name.iter().any(|v| v.on == "p" && v.strength > 0.5),
+            "record-backed basis names are valid config"
+        );
+
+        let by_scheme = judge(
+            &[foreign],
+            &Config {
+                schemes: &[("positive-evidence", 1.0)],
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !by_scheme.iter().any(|v| v.on == "p"),
+            "unregistered basis resolves to no scheme and is excluded"
+        );
     }
 
     #[test]
@@ -768,6 +974,7 @@ mod tests {
             &Config {
                 bases: &[],
                 scale: &[],
+                schemes: &[],
                 rules: "",
                 admit: None,
                 semiring: SemiringChoice::Boolean,
@@ -790,6 +997,7 @@ mod tests {
                 &Config {
                     bases: &[],
                     scale: &[],
+                    schemes: &[],
                     rules: "",
                     admit: None,
                     semiring: SemiringChoice::Boolean,

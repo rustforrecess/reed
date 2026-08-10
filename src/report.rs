@@ -192,12 +192,9 @@ mod tests {
 
     fn config() -> Config<'static> {
         Config {
-            bases: &[],
-            scale: &[],
             rules: "reportable(F) :- verified(F).\nreportable(F) :- refuted(F).",
             admit: None, // set per test
-            semiring: SemiringChoice::Boolean,
-            semantics: Semantics::DfQuad,
+            ..Config::default()
         }
     }
 

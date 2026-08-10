@@ -108,6 +108,7 @@ fn main() -> ExitCode {
         &Config {
             bases: &[],
             scale: &[],
+            schemes: &[],
             rules: &rules,
             admit: admit.as_deref(),
             semiring,

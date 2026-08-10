@@ -37,21 +37,30 @@ same stored records under every condition — no re-retrieval.
 
 | Knob | Values | Toggles |
 | --- | --- | --- |
-| `bases` | `found`, `informed-silence`, `stance`, … | which signal classes count |
+| `schemes` | `positive-evidence`, `negative-evidence`, `classification`, … | policy by argument KIND, from the closed [evidence-core registry](https://github.com/rustforrecess/evidence-core/blob/main/registry/schemes.jsonld) |
+| `bases` + `scale` | `found`, `informed-silence`, `stance`, … | per-signal override: isolate or dial one producer's signal |
 | `rules` + `admit` | Datalog / `None` | constriction on/off, any conjunctive-support policy |
 | `semiring` | `Boolean`, `MaxMin`, `Probability` | how the logical layer grades |
 | `semantics` | `DfQuad`, `LogOdds` | how the bipolar layer aggregates |
 
 ```rust
 let verdicts = reed::judge(&records, &reed::Config {
-    bases: &["found", "informed-silence"],
+    // Kind-level policy: any registered signal of these kinds counts —
+    // including signals from producers that do not exist yet.
+    schemes: &[("positive-evidence", 1.0), ("negative-evidence", 1.0)],
     rules: "admissible(P) :- found(symbolic, P), found(vector, P).",
     admit: Some("admissible"),
     semiring: reed::SemiringChoice::MaxMin,
-    semantics: reed::Semantics::DfQuad,
+    ..reed::Config::default()
 })?;
 // verdicts[i]: { on, admitted, admission, strength, contestedness, proof }
 ```
+
+Scheme and basis names in a config are validated against the registry (or
+the records themselves, for foreign producers), so a typo'd condition is a
+loud error — never a number that silently measured nothing. `schemes` and
+`bases` are mutually exclusive; scheme mode with a `scale` override covers
+both jobs.
 
 The input is any set of evidence-core records with bearings. heddle's
 `retrieve-with-evidence` testimony records are the first producer: their
